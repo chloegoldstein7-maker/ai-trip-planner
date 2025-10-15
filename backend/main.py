@@ -62,11 +62,19 @@ def _init_llm():
                 tool_calls: List[Dict[str, Any]] = []
             return _Msg()
 
-    if os.getenv("TEST_MODE"):
+    if os.getenv("TEST_MODE", "0") == "1":
+        print("Using TEST_MODE - returning fake LLM")
         return _Fake()
     
     # Check for AWS Bedrock configuration
-    if os.getenv("AWS_MODEL_ARN") and os.getenv("AWS_ACCESS_KEY_ID"):
+    model_arn = os.getenv("AWS_MODEL_ARN")
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    
+    print(f"AWS_MODEL_ARN: {model_arn}")
+    print(f"AWS_ACCESS_KEY_ID: {access_key[:10]}..." if access_key else "AWS_ACCESS_KEY_ID: None")
+    print(f"TEST_MODE: {os.getenv('TEST_MODE', '0')}")
+    
+    if model_arn and access_key:
         # Create boto3 session with credentials from environment
         session = boto3.Session(
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -74,38 +82,50 @@ def _init_llm():
             region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-2")
         )
         
-        # Extract model ID from ARN for ChatBedrock
-        model_arn = os.getenv("AWS_MODEL_ARN")
-        # ARN format: arn:aws:bedrock:region:account:inference-profile/model-id
-        model_id = model_arn.split("/")[-1] if model_arn else "anthropic.claude-3-sonnet-20240229-v1:0"
-        
-        return ChatBedrock(
-            model_id=model_id,
-            client=session.client("bedrock-runtime"),
-            model_kwargs={
-                "temperature": 0.7,
-                "max_tokens": 1500
-            }
-        )
-    elif os.getenv("OPENAI_API_KEY"):
-        # Fallback to OpenAI if configured
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model="gpt-3.5-turbo", temperature=0.7, max_tokens=1500)
-    elif os.getenv("OPENROUTER_API_KEY"):
-        # Use OpenRouter via OpenAI-compatible client
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-            base_url="https://openrouter.ai/api/v1",
-            model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
-            temperature=0.7,
-        )
+        try:
+            # For inference profiles, we need to be very explicit about the model_id
+            print(f"Initializing ChatBedrock with inference profile: {model_arn}")
+            
+            bedrock_client = session.client("bedrock-runtime")
+            
+            # Extract the model name from the ARN to determine provider
+            # ARN format: arn:aws:bedrock:region:account:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0
+            if "anthropic" in model_arn.lower() or "claude" in model_arn.lower():
+                provider = "anthropic"
+            else:
+                provider = None  # Let it auto-detect for other providers
+            
+            # Create ChatBedrock with explicit model_id as the inference profile ARN
+            llm = ChatBedrock(
+                model_id=model_arn,  # This should be the full inference profile ARN
+                client=bedrock_client,
+                model_kwargs={
+                    "temperature": 0.7,
+                    "max_tokens": 1500,
+                    "anthropic_version": "bedrock-2023-05-31"
+                },
+                # For inference profiles with Anthropic models, we need to specify the provider
+                provider=provider,
+                # Ensure streaming is disabled for compatibility
+                streaming=False,
+                # Additional settings for better compatibility
+                verbose=True
+            )
+            
+            print(f"Successfully initialized ChatBedrock with model_id: {model_arn}, provider: {provider}")
+            return llm
+            
+        except Exception as e:
+            print(f"Failed to initialize ChatBedrock with {model_arn}: {e}")
+            raise ValueError(f"Failed to initialize Bedrock model: {e}")
     else:
         # Require a key unless running tests
-        raise ValueError("Please set AWS_MODEL_ARN and AWS credentials, OPENAI_API_KEY, or OPENROUTER_API_KEY in your .env")
+        raise ValueError("Please set AWS_MODEL_ARN and AWS credentials in your .env file")
 
 
-llm = _init_llm()
+# Initialize LLM lazily to ensure it uses current configuration
+def get_llm():
+    return _init_llm()
 
 
 # Minimal tools (deterministic for tutorials)
@@ -231,42 +251,41 @@ class TripState(TypedDict):
 def research_agent(state: TripState) -> TripState:
     req = state["trip_request"]
     destination = req["destination"]
+    
+    # Manually call tools and format the information
+    essential = essential_info.invoke({"destination": destination})
+    weather = weather_brief.invoke({"destination": destination})
+    visa = visa_brief.invoke({"destination": destination})
+    
+    # Create a comprehensive prompt with all the information
     prompt_t = (
-        "You are a research assistant.\n"
-        "Gather essential information about {destination}.\n"
-        "Use tools to get weather, visa, and essential info, then summarize."
+        "You are a research assistant. Based on the following information about {destination}, "
+        "provide a comprehensive summary for the traveler:\n\n"
+        "Essential Information:\n{essential}\n\n"
+        "Weather Information:\n{weather}\n\n"
+        "Visa Information:\n{visa}\n\n"
+        "Please synthesize this information into a helpful summary."
     )
-    vars_ = {"destination": destination}
+    vars_ = {
+        "destination": destination,
+        "essential": essential,
+        "weather": weather,
+        "visa": visa
+    }
     
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [essential_info, weather_brief, visa_brief]
-    agent = llm.bind_tools(tools)
+    # Use HumanMessage instead of SystemMessage for better compatibility
+    messages = [HumanMessage(content=prompt_t.format(**vars_))]
     
-    calls: List[Dict[str, Any]] = []
-    tool_results = []
+    calls = [
+        {"agent": "research", "tool": "essential_info", "args": {"destination": destination}},
+        {"agent": "research", "tool": "weather_brief", "args": {"destination": destination}},
+        {"agent": "research", "tool": "visa_brief", "args": {"destination": destination}}
+    ]
     
     with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
+        res = get_llm().invoke(messages)
     
-    # Collect tool calls and execute them
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "research", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        tool_results = tr["messages"]
-        
-        # Add tool results to conversation and ask LLM to synthesize
-        messages.append(res)
-        messages.extend(tool_results)
-        messages.append(SystemMessage(content="Based on the above information, provide a comprehensive summary for the traveler."))
-        
-        # Get final synthesis from LLM
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    out = res.content
 
     return {"messages": [SystemMessage(content=out)], "research": out, "tool_calls": calls}
 
@@ -275,38 +294,39 @@ def budget_agent(state: TripState) -> TripState:
     req = state["trip_request"]
     destination, duration = req["destination"], req["duration"]
     budget = req.get("budget", "moderate")
+    
+    # Manually call tools and format the information
+    budget_info = budget_basics.invoke({"destination": destination, "duration": duration})
+    attractions = attraction_prices.invoke({"destination": destination})
+    
+    # Create a comprehensive prompt with all the information
     prompt_t = (
-        "You are a budget analyst.\n"
-        "Analyze costs for {destination} over {duration} with budget: {budget}.\n"
-        "Use tools to get pricing information, then provide a detailed breakdown."
+        "You are a budget analyst. Based on the following information, "
+        "create a detailed budget breakdown for {duration} in {destination} with a {budget} budget:\n\n"
+        "Budget Overview:\n{budget_info}\n\n"
+        "Attraction Prices:\n{attractions}\n\n"
+        "Please provide a comprehensive budget plan with daily breakdowns and money-saving tips."
     )
-    vars_ = {"destination": destination, "duration": duration, "budget": budget}
+    vars_ = {
+        "destination": destination,
+        "duration": duration,
+        "budget": budget,
+        "budget_info": budget_info,
+        "attractions": attractions
+    }
     
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [budget_basics, attraction_prices]
-    agent = llm.bind_tools(tools)
+    # Use HumanMessage instead of SystemMessage for better compatibility
+    messages = [HumanMessage(content=prompt_t.format(**vars_))]
     
-    calls: List[Dict[str, Any]] = []
+    calls = [
+        {"agent": "budget", "tool": "budget_basics", "args": {"destination": destination, "duration": duration}},
+        {"agent": "budget", "tool": "attraction_prices", "args": {"destination": destination}}
+    ]
     
     with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
+        res = get_llm().invoke(messages)
     
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "budget", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        
-        # Add tool results and ask for synthesis
-        messages.append(res)
-        messages.extend(tr["messages"])
-        messages.append(SystemMessage(content=f"Create a detailed budget breakdown for {duration} in {destination} with a {budget} budget."))
-        
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    out = res.content
 
     return {"messages": [SystemMessage(content=out)], "budget": out, "tool_calls": calls}
 
@@ -316,38 +336,44 @@ def local_agent(state: TripState) -> TripState:
     destination = req["destination"]
     interests = req.get("interests", "local culture")
     travel_style = req.get("travel_style", "standard")
+    
+    # Manually call tools and format the information
+    local_exp = local_flavor.invoke({"destination": destination, "interests": interests})
+    customs = local_customs.invoke({"destination": destination})
+    gems = hidden_gems.invoke({"destination": destination})
+    
+    # Create a comprehensive prompt with all the information
     prompt_t = (
-        "You are a local guide.\n"
-        "Find authentic experiences in {destination} for someone interested in: {interests}.\n"
-        "Travel style: {travel_style}. Use tools to gather local insights."
+        "You are a local guide. Based on the following information about {destination}, "
+        "create a curated list of authentic experiences for someone interested in {interests} "
+        "with a {travel_style} travel approach:\n\n"
+        "Local Experiences:\n{local_exp}\n\n"
+        "Local Customs:\n{customs}\n\n"
+        "Hidden Gems:\n{gems}\n\n"
+        "Please provide personalized recommendations that match their interests and travel style."
     )
-    vars_ = {"destination": destination, "interests": interests, "travel_style": travel_style}
+    vars_ = {
+        "destination": destination,
+        "interests": interests,
+        "travel_style": travel_style,
+        "local_exp": local_exp,
+        "customs": customs,
+        "gems": gems
+    }
     
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [local_flavor, local_customs, hidden_gems]
-    agent = llm.bind_tools(tools)
+    # Use HumanMessage instead of SystemMessage for better compatibility
+    messages = [HumanMessage(content=prompt_t.format(**vars_))]
     
-    calls: List[Dict[str, Any]] = []
+    calls = [
+        {"agent": "local", "tool": "local_flavor", "args": {"destination": destination, "interests": interests}},
+        {"agent": "local", "tool": "local_customs", "args": {"destination": destination}},
+        {"agent": "local", "tool": "hidden_gems", "args": {"destination": destination}}
+    ]
     
     with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
+        res = get_llm().invoke(messages)
     
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "local", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        
-        # Add tool results and ask for synthesis
-        messages.append(res)
-        messages.extend(tr["messages"])
-        messages.append(SystemMessage(content=f"Create a curated list of authentic experiences for someone interested in {interests} with a {travel_style} approach."))
-        
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    out = res.content
 
     return {"messages": [SystemMessage(content=out)], "local": out, "tool_calls": calls}
 
@@ -370,7 +396,7 @@ def itinerary_agent(state: TripState) -> TripState:
         "local": (state.get("local") or "")[:400],
     }
     with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = llm.invoke([SystemMessage(content=prompt_t.format(**vars_))])
+        res = get_llm().invoke([HumanMessage(content=prompt_t.format(**vars_))])
     return {"messages": [SystemMessage(content=res.content)], "final": res.content}
 
 
