@@ -32,7 +32,8 @@ from typing_extensions import TypedDict, Annotated
 import operator
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_aws import ChatBedrock
+import boto3
 
 
 class TripRequest(BaseModel):
@@ -63,10 +64,36 @@ def _init_llm():
 
     if os.getenv("TEST_MODE"):
         return _Fake()
-    if os.getenv("OPENAI_API_KEY"):
+    
+    # Check for AWS Bedrock configuration
+    if os.getenv("AWS_MODEL_ARN") and os.getenv("AWS_ACCESS_KEY_ID"):
+        # Create boto3 session with credentials from environment
+        session = boto3.Session(
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+        )
+        
+        # Extract model ID from ARN for ChatBedrock
+        model_arn = os.getenv("AWS_MODEL_ARN")
+        # ARN format: arn:aws:bedrock:region:account:inference-profile/model-id
+        model_id = model_arn.split("/")[-1] if model_arn else "anthropic.claude-3-sonnet-20240229-v1:0"
+        
+        return ChatBedrock(
+            model_id=model_id,
+            client=session.client("bedrock-runtime"),
+            model_kwargs={
+                "temperature": 0.7,
+                "max_tokens": 1500
+            }
+        )
+    elif os.getenv("OPENAI_API_KEY"):
+        # Fallback to OpenAI if configured
+        from langchain_openai import ChatOpenAI
         return ChatOpenAI(model="gpt-3.5-turbo", temperature=0.7, max_tokens=1500)
     elif os.getenv("OPENROUTER_API_KEY"):
         # Use OpenRouter via OpenAI-compatible client
+        from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             api_key=os.getenv("OPENROUTER_API_KEY"),
             base_url="https://openrouter.ai/api/v1",
@@ -75,7 +102,7 @@ def _init_llm():
         )
     else:
         # Require a key unless running tests
-        raise ValueError("Please set OPENAI_API_KEY or OPENROUTER_API_KEY in your .env")
+        raise ValueError("Please set AWS_MODEL_ARN and AWS credentials, OPENAI_API_KEY, or OPENROUTER_API_KEY in your .env")
 
 
 llm = _init_llm()
